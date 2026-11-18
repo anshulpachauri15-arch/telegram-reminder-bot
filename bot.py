@@ -1,11 +1,13 @@
 import logging
+import re
 import sys
 from datetime import datetime, time as dt_time
 from functools import wraps
 
+import dateparser.search
 from telegram import Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 from config import BOT_TOKEN, ALLOWED_USER_IDS, TZ, MORNING_DIGEST_HOUR, MORNING_DIGEST_MINUTE
 from database import (
@@ -233,6 +235,70 @@ async def job_morning_digest(context: ContextTypes.DEFAULT_TYPE):
             log.error(f"Could not send digest to {chat_id}: {e}")
 
 
+# ── Natural language handler ──────────────────────────────────────────────────
+
+_FILLER = re.compile(
+    r"^(remind me (about|to|of)?|reminder (for|about)?|set (a )?reminder (for|about)?)\s*",
+    re.IGNORECASE,
+)
+
+@require_auth
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.effective_message.text.strip()
+    msg = update.effective_message
+
+    # Search for a date/time expression anywhere in the message
+    results = dateparser.search.search_dates(
+        text,
+        languages=["en"],
+        settings={
+            "PREFER_DATES_FROM": "future",
+            "TIMEZONE": TIMEZONE,
+            "TO_TIMEZONE": TIMEZONE,
+            "RETURN_AS_TIMEZONE_AWARE": False,
+        },
+    )
+
+    if not results:
+        await msg.reply_text(
+            "⚠️ I couldn't find a date or time in your message.\n\n"
+            "Try: `dentist tomorrow 9am` or `/remind tomorrow 9am Dentist`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    # Use the first recognised date expression
+    date_str_found, remind_at = results[0]
+
+    if remind_at <= datetime.now(TZ).replace(tzinfo=None):
+        await msg.reply_text("❌ That time seems to be in the past. Can you be more specific?")
+        return
+
+    # Strip the date fragment from the original text to get the reminder label
+    reminder_text = text.replace(date_str_found, "").strip()
+    reminder_text = re.sub(r"\s{2,}", " ", reminder_text)   # collapse gaps
+    reminder_text = _FILLER.sub("", reminder_text).strip()   # drop filler phrases
+    if not reminder_text:
+        reminder_text = "Reminder"
+
+    chat = update.effective_chat
+    register_chat(chat.id, chat.title or update.effective_user.first_name)
+
+    rid = add_reminder(
+        user_id=update.effective_user.id,
+        chat_id=chat.id,
+        message=reminder_text,
+        remind_at=remind_at,
+    )
+
+    friendly = remind_at.strftime("%A, %b %d at %I:%M %p")
+    await msg.reply_text(
+        f"✅ *Got it!*\n📅 {friendly}\n📝 {reminder_text}\n🔖 ID: `{rid}`\n\n"
+        f"_Wrong time? /delete {rid} and try again._",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
@@ -254,6 +320,9 @@ def main():
         ("delete",    cmd_delete),
     ]:
         app.add_handler(CommandHandler(cmd, handler))
+
+    # Plain text messages → natural language reminder parsing
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     jq = app.job_queue
     jq.run_repeating(job_check_due, interval=60, first=5)
