@@ -16,8 +16,8 @@ from config import TZ, TIMEZONE
 
 log = logging.getLogger(__name__)
 
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+LLM_MODEL = os.getenv("LLM_MODEL", "meta-llama/llama-3.1-8b-instruct:free")
 
 _client: Optional[OpenAI] = None
 
@@ -26,8 +26,9 @@ def _get_client() -> OpenAI:
     global _client
     if _client is None:
         _client = OpenAI(
-            base_url="https://models.inference.ai.azure.com",
-            api_key=GITHUB_TOKEN,
+            base_url="https://openrouter.ai/api/v1",
+            api_key=OPENROUTER_API_KEY,
+            max_retries=0,
         )
     return _client
 
@@ -62,7 +63,7 @@ def parse_reminder(text: str) -> Optional[dict]:
 
     Returns None if parsing fails or GITHUB_TOKEN is not set.
     """
-    if not GITHUB_TOKEN:
+    if not OPENROUTER_API_KEY:
         return None
 
     now = datetime.now(TZ)

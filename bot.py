@@ -4,7 +4,7 @@ import sys
 from datetime import datetime, timedelta, time as dt_time
 from functools import wraps
 
-from llm import parse_reminder as llm_parse, GITHUB_TOKEN as _GITHUB_TOKEN, LLM_MODEL
+from llm import parse_reminder as llm_parse, OPENROUTER_API_KEY as _LLM_KEY, LLM_MODEL
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -16,7 +16,7 @@ from database import (
     get_due_reminders, mark_sent, delete_reminder,
     get_all_registered_chats,
 )
-from date_parser import parse_reminder_datetime
+from date_parser import parse_reminder_datetime, find_datetime_in_text
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -338,24 +338,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             recurrence = "weekly"
             parse_text = re.sub(r"\bevery\b", "", text, flags=re.IGNORECASE).strip()
 
-        words = parse_text.split()
-        for i in range(len(words)):
-            # Try two-word date + time: "next monday 9am"
-            if i + 2 < len(words):
-                dt = parse_reminder_datetime(f"{words[i]} {words[i+1]}", words[i+2], TZ)
-                if dt and dt > now:
-                    remind_at = dt
-                    leftover = words[:i] + words[i+3:]
-                    reminder_text = _FILLER.sub("", " ".join(leftover)).strip() or "Reminder"
-                    break
-            # Try one-word date + time: "tomorrow 9am"
-            if i + 1 < len(words):
-                dt = parse_reminder_datetime(words[i], words[i+1], TZ)
-                if dt and dt > now:
-                    remind_at = dt
-                    leftover = words[:i] + words[i+2:]
-                    reminder_text = _FILLER.sub("", " ".join(leftover)).strip() or "Reminder"
-                    break
+        remind_at, leftover = find_datetime_in_text(parse_text, TZ)
+        if remind_at is not None:
+            reminder_text = _FILLER.sub("", leftover).strip() or "Reminder"
 
         if remind_at and recurrence == "daily" and remind_at <= now:
             remind_at += timedelta(days=1)
@@ -436,7 +421,7 @@ def main():
     log.info(
         f"Bot running | TZ={TZ} | digest at {MORNING_DIGEST_HOUR:02d}:{MORNING_DIGEST_MINUTE:02d} | "
         f"allowed users: {ALLOWED_USER_IDS or 'everyone (bootstrap mode)'} | "
-        f"LLM: {'GitHub Models (' + LLM_MODEL + ')' if _GITHUB_TOKEN else 'disabled (no GITHUB_TOKEN)'}"
+        f"LLM: {'OpenRouter (' + LLM_MODEL + ')' if _LLM_KEY else 'disabled (no OPENROUTER_API_KEY)'}"
     )
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
