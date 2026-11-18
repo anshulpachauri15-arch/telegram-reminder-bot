@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, time as dt_time
 from functools import wraps
 
 import dateparser.search
+from llm import parse_reminder as llm_parse
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -313,30 +314,48 @@ _WEEKDAY_PATTERN = r"monday|tuesday|wednesday|thursday|friday|saturday|sunday"
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.effective_message.text.strip()
     msg = update.effective_message
+    now = datetime.now(TZ).replace(tzinfo=None)
 
-    # Detect recurrence keywords before passing to date parser
+    remind_at = None
+    reminder_text = None
     recurrence = None
-    parse_text = text
 
-    if re.search(r"\b(every day|daily)\b", text, re.IGNORECASE):
-        recurrence = "daily"
-        parse_text = re.sub(r"\b(every day|daily)\b", "", text, flags=re.IGNORECASE).strip()
-    elif re.search(rf"\bevery\s+({_WEEKDAY_PATTERN}|week)\b", text, re.IGNORECASE):
-        recurrence = "weekly"
-        parse_text = re.sub(r"\bevery\b", "", text, flags=re.IGNORECASE).strip()
+    # ── Try LLM first (GitHub Models) ────────────────────────────────────────
+    result = llm_parse(text)
+    if result:
+        remind_at = result["remind_at"]
+        reminder_text = result["message"]
+        recurrence = result["recurrence"]
 
-    results = dateparser.search.search_dates(
-        parse_text,
-        languages=["en"],
-        settings={
-            "PREFER_DATES_FROM": "future",
-            "TIMEZONE": TIMEZONE,
-            "TO_TIMEZONE": TIMEZONE,
-            "RETURN_AS_TIMEZONE_AWARE": False,
-        },
-    )
+    # ── Fallback: regex + dateparser ─────────────────────────────────────────
+    if remind_at is None:
+        parse_text = text
+        if re.search(r"\b(every day|daily)\b", text, re.IGNORECASE):
+            recurrence = "daily"
+            parse_text = re.sub(r"\b(every day|daily)\b", "", text, flags=re.IGNORECASE).strip()
+        elif re.search(rf"\bevery\s+({_WEEKDAY_PATTERN}|week)\b", text, re.IGNORECASE):
+            recurrence = "weekly"
+            parse_text = re.sub(r"\bevery\b", "", text, flags=re.IGNORECASE).strip()
 
-    if not results:
+        results = dateparser.search.search_dates(
+            parse_text,
+            languages=["en"],
+            settings={
+                "PREFER_DATES_FROM": "future",
+                "TIMEZONE": TIMEZONE,
+                "TO_TIMEZONE": TIMEZONE,
+                "RETURN_AS_TIMEZONE_AWARE": False,
+            },
+        )
+        if results:
+            date_str_found, remind_at = results[0]
+            if recurrence == "daily" and remind_at <= now:
+                remind_at += timedelta(days=1)
+            reminder_text = parse_text.replace(date_str_found, "").strip()
+            reminder_text = re.sub(r"\s{2,}", " ", reminder_text)
+            reminder_text = _FILLER.sub("", reminder_text).strip() or "Reminder"
+
+    if remind_at is None:
         await msg.reply_text(
             "⚠️ I couldn't find a date or time in your message.\n\n"
             "Try: `dentist tomorrow 9am` or `/remind tomorrow 9am Dentist`",
@@ -344,22 +363,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    date_str_found, remind_at = results[0]
-    now = datetime.now(TZ).replace(tzinfo=None)
-
-    # For daily recurrence, if parsed time is past, shift to tomorrow
-    if recurrence == "daily" and remind_at <= now:
-        remind_at += timedelta(days=1)
-
     if remind_at <= now:
         await msg.reply_text("❌ That time seems to be in the past. Can you be more specific?")
         return
-
-    reminder_text = parse_text.replace(date_str_found, "").strip()
-    reminder_text = re.sub(r"\s{2,}", " ", reminder_text)
-    reminder_text = _FILLER.sub("", reminder_text).strip()
-    if not reminder_text:
-        reminder_text = "Reminder"
 
     chat = update.effective_chat
     register_chat(chat.id, chat.title or update.effective_user.first_name)
