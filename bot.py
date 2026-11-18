@@ -4,8 +4,7 @@ import sys
 from datetime import datetime, timedelta, time as dt_time
 from functools import wraps
 
-import dateparser.search
-from llm import parse_reminder as llm_parse
+from llm import parse_reminder as llm_parse, GITHUB_TOKEN as _GITHUB_TOKEN, LLM_MODEL
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -327,9 +326,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reminder_text = result["message"]
         recurrence = result["recurrence"]
 
-    # ── Fallback: regex + dateparser ─────────────────────────────────────────
+    # ── Fallback: scan words with our custom date parser ─────────────────────
     if remind_at is None:
         parse_text = text
+
+        # Detect recurrence keywords first
         if re.search(r"\b(every day|daily)\b", text, re.IGNORECASE):
             recurrence = "daily"
             parse_text = re.sub(r"\b(every day|daily)\b", "", text, flags=re.IGNORECASE).strip()
@@ -337,24 +338,27 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             recurrence = "weekly"
             parse_text = re.sub(r"\bevery\b", "", text, flags=re.IGNORECASE).strip()
 
-        results = dateparser.search.search_dates(
-            parse_text,
-            languages=["en"],
-            settings={
-                "PREFER_DATES_FROM": "future",
-                "TIMEZONE": TIMEZONE,
-                "TO_TIMEZONE": TIMEZONE,
-                "RETURN_AS_TIMEZONE_AWARE": False,
-            },
-        )
-        if results:
-            # Take the longest matched string — it's the most specific
-            date_str_found, remind_at = max(results, key=lambda x: len(x[0]))
-            if recurrence == "daily" and remind_at <= now:
-                remind_at += timedelta(days=1)
-            reminder_text = parse_text.replace(date_str_found, "").strip()
-            reminder_text = re.sub(r"\s{2,}", " ", reminder_text)
-            reminder_text = _FILLER.sub("", reminder_text).strip() or "Reminder"
+        words = parse_text.split()
+        for i in range(len(words)):
+            # Try two-word date + time: "next monday 9am"
+            if i + 2 < len(words):
+                dt = parse_reminder_datetime(f"{words[i]} {words[i+1]}", words[i+2], TZ)
+                if dt and dt > now:
+                    remind_at = dt
+                    leftover = words[:i] + words[i+3:]
+                    reminder_text = _FILLER.sub("", " ".join(leftover)).strip() or "Reminder"
+                    break
+            # Try one-word date + time: "tomorrow 9am"
+            if i + 1 < len(words):
+                dt = parse_reminder_datetime(words[i], words[i+1], TZ)
+                if dt and dt > now:
+                    remind_at = dt
+                    leftover = words[:i] + words[i+2:]
+                    reminder_text = _FILLER.sub("", " ".join(leftover)).strip() or "Reminder"
+                    break
+
+        if remind_at and recurrence == "daily" and remind_at <= now:
+            remind_at += timedelta(days=1)
 
     if remind_at is None:
         await msg.reply_text(
@@ -431,7 +435,8 @@ def main():
 
     log.info(
         f"Bot running | TZ={TZ} | digest at {MORNING_DIGEST_HOUR:02d}:{MORNING_DIGEST_MINUTE:02d} | "
-        f"allowed users: {ALLOWED_USER_IDS or 'everyone (bootstrap mode)'}"
+        f"allowed users: {ALLOWED_USER_IDS or 'everyone (bootstrap mode)'} | "
+        f"LLM: {'GitHub Models (' + LLM_MODEL + ')' if _GITHUB_TOKEN else 'disabled (no GITHUB_TOKEN)'}"
     )
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
