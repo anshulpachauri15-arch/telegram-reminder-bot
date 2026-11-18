@@ -1,7 +1,7 @@
 import logging
 import re
 import sys
-from datetime import datetime, time as dt_time
+from datetime import datetime, timedelta, time as dt_time
 from functools import wraps
 
 import dateparser.search
@@ -9,7 +9,7 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-from config import BOT_TOKEN, ALLOWED_USER_IDS, TZ, MORNING_DIGEST_HOUR, MORNING_DIGEST_MINUTE
+from config import BOT_TOKEN, ALLOWED_USER_IDS, TZ, TIMEZONE, MORNING_DIGEST_HOUR, MORNING_DIGEST_MINUTE
 from database import (
     init_db, register_chat, add_reminder,
     get_upcoming_reminders, get_todays_reminders,
@@ -59,14 +59,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 *Hi! I'm your personal reminder bot!*\n\n"
         "I'll ping you at the exact time and send a morning digest every day.\n\n"
         "📋 *Commands:*\n"
-        "`/remind <date> <time> <message>` — set a reminder\n"
+        "`/remind <date> <time> <message>` — one-time reminder\n"
+        "`/remind daily <time> <message>` — repeats every day\n"
+        "`/remind weekly <day> <time> <message>` — repeats every week\n"
         "`/reminders` — list all upcoming\n"
         "`/today` — today's reminders\n"
         "`/delete <id>` — remove a reminder\n"
         "`/help` — usage guide\n\n"
-        "📅 *Date:* `today`, `tomorrow`, `monday`, `25/12`, `next friday`\n"
-        "⏰ *Time:* `9am`, `3:30pm`, `14:00`\n\n"
-        "_Example:_ `/remind tomorrow 9am Dentist appointment`\n\n"
+        "Or just type naturally: `dentist tomorrow 9am`\n\n"
         f"Your user ID: `{uid}`",
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -76,26 +76,25 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "🤖 *Reminder Bot — Help*\n\n"
-        "*Set a reminder:*\n"
+        "*One-time reminder:*\n"
         "`/remind <date> <time> <message>`\n\n"
+        "*Recurring reminders:*\n"
+        "`/remind daily 8am Take vitamins`\n"
+        "`/remind weekly monday 9am Team standup`\n"
+        "`/remind every friday 6pm Weekend plans`\n\n"
+        "*Natural language (just type):*\n"
+        "`dentist tomorrow 9am`\n"
+        "`call mom daily 7pm`\n"
+        "`standup every monday 10am`\n\n"
         "*Date formats:*\n"
-        "• `today`, `tomorrow`\n"
-        "• `monday` … `sunday` _(next occurrence)_\n"
-        "• `next monday`, `next friday`\n"
-        "• `25/12`, `25/12/2025`, `2025-12-25`\n"
-        "• `dec 25`, `25 dec`\n\n"
+        "• `today`, `tomorrow`, `monday` … `sunday`\n"
+        "• `next friday`, `25/12`, `2025-12-25`, `dec 25`\n\n"
         "*Time formats:*\n"
-        "• `9am`, `3pm`, `3:30pm`, `10:15am`\n"
-        "• `09:00`, `15:30`\n\n"
-        "*Examples:*\n"
-        "`/remind tomorrow 9am Dentist`\n"
-        "`/remind 25/12 6pm Christmas dinner`\n"
-        "`/remind next friday 10:30am Project review`\n"
-        "`/remind monday 8am Take medication`\n\n"
+        "• `9am`, `3:30pm`, `14:00`\n\n"
         "*Other commands:*\n"
-        "`/reminders` — all upcoming\n"
+        "`/reminders` — all upcoming (🔁 = recurring)\n"
         "`/today` — today only\n"
-        "`/delete 5` — remove reminder #5",
+        "`/delete 5` — remove reminder #5 _(stops recurring series too)_",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -105,27 +104,63 @@ async def cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args or []
     msg = update.effective_message
 
-    if len(args) < 3:
+    if not args:
         await msg.reply_text(
             "❌ Usage: `/remind <date> <time> <message>`\n\n"
-            "_Example:_ `/remind tomorrow 3pm Dentist appointment`",
+            "_Example:_ `/remind tomorrow 3pm Dentist`",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
 
-    # Try single-word date first, then two-word (e.g. "next monday")
-    remind_at = parse_reminder_datetime(args[0], args[1], TZ)
+    recurrence = None
+    remind_at = None
     msg_start = 2
-    if remind_at is None and len(args) >= 4:
-        remind_at = parse_reminder_datetime(f"{args[0]} {args[1]}", args[2], TZ)
+    first = args[0].lower()
+
+    if first == "daily":
+        # /remind daily 8am Take vitamins
+        if len(args) < 3:
+            await msg.reply_text(
+                "❌ Usage: `/remind daily <time> <message>`\n"
+                "_Example:_ `/remind daily 8am Take vitamins`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        remind_at = parse_reminder_datetime("today", args[1], TZ)
+        # If today's time has already passed, start tomorrow
+        if remind_at and remind_at <= datetime.now(TZ).replace(tzinfo=None):
+            remind_at = parse_reminder_datetime("tomorrow", args[1], TZ)
+        msg_start = 2
+        recurrence = "daily"
+
+    elif first in ("weekly", "every") and len(args) >= 4:
+        # /remind weekly monday 9am Standup
+        # /remind every friday 6pm Weekend plans
+        remind_at = parse_reminder_datetime(args[1], args[2], TZ)
         msg_start = 3
+        recurrence = "weekly"
+
+    else:
+        # Normal one-time reminder
+        if len(args) < 3:
+            await msg.reply_text(
+                "❌ Usage: `/remind <date> <time> <message>`\n\n"
+                "_Example:_ `/remind tomorrow 3pm Dentist`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        remind_at = parse_reminder_datetime(args[0], args[1], TZ)
+        msg_start = 2
+        if remind_at is None and len(args) >= 4:
+            remind_at = parse_reminder_datetime(f"{args[0]} {args[1]}", args[2], TZ)
+            msg_start = 3
 
     if remind_at is None:
         await msg.reply_text(
             "❌ Could not parse date/time. Try:\n"
             "`/remind tomorrow 9am Dentist`\n"
-            "`/remind 25/12 3pm Party`\n"
-            "`/remind next monday 10am Meeting`",
+            "`/remind daily 8am Vitamins`\n"
+            "`/remind weekly monday 9am Standup`",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -143,11 +178,25 @@ async def cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=chat.id,
         message=reminder_text,
         remind_at=remind_at,
+        recurrence=recurrence,
     )
 
-    friendly = remind_at.strftime("%A, %b %d at %I:%M %p")
+    if recurrence == "daily":
+        friendly = f"Every day at {remind_at.strftime('%I:%M %p')}"
+        note = f"_To stop this series: /delete {rid}_"
+        icon = "🔁"
+    elif recurrence == "weekly":
+        friendly = f"Every {remind_at.strftime('%A')} at {remind_at.strftime('%I:%M %p')}"
+        note = f"_To stop this series: /delete {rid}_"
+        icon = "🔁"
+    else:
+        friendly = remind_at.strftime("%A, %b %d at %I:%M %p")
+        note = ""
+        icon = "✅"
+
     await msg.reply_text(
-        f"✅ *Reminder set!*\n📅 {friendly}\n📝 {reminder_text}\n🔖 ID: `{rid}`",
+        f"{icon} *Reminder set!*\n📅 {friendly}\n📝 {reminder_text}\n🔖 ID: `{rid}`"
+        + (f"\n\n{note}" if note else ""),
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -161,7 +210,8 @@ async def cmd_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["📋 *Upcoming Reminders:*\n"]
     for r in items:
         dt = datetime.fromisoformat(r["remind_at"])
-        lines.append(f"🔖 `#{r['id']}` {dt.strftime('%a %b %d, %I:%M %p')} — {r['message']}")
+        recur = " 🔁" if r.get("recurrence") else ""
+        lines.append(f"🔖 `#{r['id']}` {dt.strftime('%a %b %d, %I:%M %p')} — {r['message']}{recur}")
     await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
@@ -175,7 +225,8 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"📅 *Today — {label}:*\n"]
     for r in items:
         dt = datetime.fromisoformat(r["remind_at"])
-        lines.append(f"⏰ {dt.strftime('%I:%M %p')} — {r['message']} _(#{r['id']})_")
+        recur = " 🔁" if r.get("recurrence") else ""
+        lines.append(f"⏰ {dt.strftime('%I:%M %p')} — {r['message']}{recur} _(#{r['id']})_")
     await update.effective_message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
@@ -204,13 +255,26 @@ async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def job_check_due(context: ContextTypes.DEFAULT_TYPE):
     for r in get_due_reminders():
         try:
+            icon = "🔁" if r.get("recurrence") else "⏰"
             await context.bot.send_message(
                 chat_id=r["chat_id"],
-                text=f"⏰ *Reminder!*\n\n{r['message']}",
+                text=f"{icon} *Reminder!*\n\n{r['message']}",
                 parse_mode=ParseMode.MARKDOWN,
             )
             mark_sent(r["id"])
             log.info(f"Sent reminder #{r['id']} to chat {r['chat_id']}")
+
+            # Auto-schedule next occurrence for recurring reminders
+            recurrence = r.get("recurrence")
+            if recurrence == "daily":
+                next_dt = datetime.fromisoformat(r["remind_at"]) + timedelta(days=1)
+                add_reminder(r["user_id"], r["chat_id"], r["message"], next_dt, "daily")
+                log.info(f"Rescheduled daily reminder for {next_dt.date()}")
+            elif recurrence == "weekly":
+                next_dt = datetime.fromisoformat(r["remind_at"]) + timedelta(weeks=1)
+                add_reminder(r["user_id"], r["chat_id"], r["message"], next_dt, "weekly")
+                log.info(f"Rescheduled weekly reminder for {next_dt.date()}")
+
         except Exception as e:
             log.error(f"Could not send reminder #{r['id']}: {e}")
 
@@ -224,7 +288,8 @@ async def job_morning_digest(context: ContextTypes.DEFAULT_TYPE):
         lines = [f"🌅 *Good morning! Reminders for {label}:*\n"]
         for r in items:
             dt = datetime.fromisoformat(r["remind_at"])
-            lines.append(f"⏰ {dt.strftime('%I:%M %p')} — {r['message']}")
+            recur = " 🔁" if r.get("recurrence") else ""
+            lines.append(f"⏰ {dt.strftime('%I:%M %p')} — {r['message']}{recur}")
         try:
             await context.bot.send_message(
                 chat_id=chat_id,
@@ -241,15 +306,27 @@ _FILLER = re.compile(
     r"^(remind me (about|to|of)?|reminder (for|about)?|set (a )?reminder (for|about)?)\s*",
     re.IGNORECASE,
 )
+_WEEKDAY_PATTERN = r"monday|tuesday|wednesday|thursday|friday|saturday|sunday"
+
 
 @require_auth
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.effective_message.text.strip()
     msg = update.effective_message
 
-    # Search for a date/time expression anywhere in the message
+    # Detect recurrence keywords before passing to date parser
+    recurrence = None
+    parse_text = text
+
+    if re.search(r"\b(every day|daily)\b", text, re.IGNORECASE):
+        recurrence = "daily"
+        parse_text = re.sub(r"\b(every day|daily)\b", "", text, flags=re.IGNORECASE).strip()
+    elif re.search(rf"\bevery\s+({_WEEKDAY_PATTERN}|week)\b", text, re.IGNORECASE):
+        recurrence = "weekly"
+        parse_text = re.sub(r"\bevery\b", "", text, flags=re.IGNORECASE).strip()
+
     results = dateparser.search.search_dates(
-        text,
+        parse_text,
         languages=["en"],
         settings={
             "PREFER_DATES_FROM": "future",
@@ -267,17 +344,20 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Use the first recognised date expression
     date_str_found, remind_at = results[0]
+    now = datetime.now(TZ).replace(tzinfo=None)
 
-    if remind_at <= datetime.now(TZ).replace(tzinfo=None):
+    # For daily recurrence, if parsed time is past, shift to tomorrow
+    if recurrence == "daily" and remind_at <= now:
+        remind_at += timedelta(days=1)
+
+    if remind_at <= now:
         await msg.reply_text("❌ That time seems to be in the past. Can you be more specific?")
         return
 
-    # Strip the date fragment from the original text to get the reminder label
-    reminder_text = text.replace(date_str_found, "").strip()
-    reminder_text = re.sub(r"\s{2,}", " ", reminder_text)   # collapse gaps
-    reminder_text = _FILLER.sub("", reminder_text).strip()   # drop filler phrases
+    reminder_text = parse_text.replace(date_str_found, "").strip()
+    reminder_text = re.sub(r"\s{2,}", " ", reminder_text)
+    reminder_text = _FILLER.sub("", reminder_text).strip()
     if not reminder_text:
         reminder_text = "Reminder"
 
@@ -289,12 +369,24 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id=chat.id,
         message=reminder_text,
         remind_at=remind_at,
+        recurrence=recurrence,
     )
 
-    friendly = remind_at.strftime("%A, %b %d at %I:%M %p")
+    if recurrence == "daily":
+        friendly = f"Every day at {remind_at.strftime('%I:%M %p')}"
+        note = f"_To stop: /delete {rid}_"
+        icon = "🔁"
+    elif recurrence == "weekly":
+        friendly = f"Every {remind_at.strftime('%A')} at {remind_at.strftime('%I:%M %p')}"
+        note = f"_To stop: /delete {rid}_"
+        icon = "🔁"
+    else:
+        friendly = remind_at.strftime("%A, %b %d at %I:%M %p")
+        note = f"_Wrong time? /delete {rid} and try again._"
+        icon = "✅"
+
     await msg.reply_text(
-        f"✅ *Got it!*\n📅 {friendly}\n📝 {reminder_text}\n🔖 ID: `{rid}`\n\n"
-        f"_Wrong time? /delete {rid} and try again._",
+        f"{icon} *Got it!*\n📅 {friendly}\n📝 {reminder_text}\n🔖 ID: `{rid}`\n\n{note}",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -321,7 +413,6 @@ def main():
     ]:
         app.add_handler(CommandHandler(cmd, handler))
 
-    # Plain text messages → natural language reminder parsing
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     jq = app.job_queue

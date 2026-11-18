@@ -8,7 +8,6 @@ from config import DATABASE_PATH, TZ
 
 
 def _now() -> datetime:
-    """Current local time as a naive datetime."""
     return datetime.now(TZ).replace(tzinfo=None)
 
 
@@ -28,6 +27,7 @@ def init_db():
                 chat_id    INTEGER NOT NULL,
                 message    TEXT    NOT NULL,
                 remind_at  TEXT    NOT NULL,
+                recurrence TEXT,
                 sent       INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT    NOT NULL DEFAULT (datetime('now'))
             );
@@ -37,6 +37,11 @@ def init_db():
                 registered_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
         """)
+        # Migrate existing databases that don't have the recurrence column yet
+        try:
+            conn.execute("ALTER TABLE reminders ADD COLUMN recurrence TEXT")
+        except sqlite3.OperationalError:
+            pass
 
 
 @contextmanager
@@ -58,11 +63,17 @@ def register_chat(chat_id: int, title: Optional[str] = None):
         )
 
 
-def add_reminder(user_id: int, chat_id: int, message: str, remind_at: datetime) -> int:
+def add_reminder(
+    user_id: int,
+    chat_id: int,
+    message: str,
+    remind_at: datetime,
+    recurrence: Optional[str] = None,
+) -> int:
     with _conn() as conn:
         cur = conn.execute(
-            "INSERT INTO reminders (user_id, chat_id, message, remind_at) VALUES (?, ?, ?, ?)",
-            (user_id, chat_id, message, remind_at.isoformat()),
+            "INSERT INTO reminders (user_id, chat_id, message, remind_at, recurrence) VALUES (?, ?, ?, ?, ?)",
+            (user_id, chat_id, message, remind_at.isoformat(), recurrence),
         )
         return cur.lastrowid
 
@@ -70,7 +81,7 @@ def add_reminder(user_id: int, chat_id: int, message: str, remind_at: datetime) 
 def get_upcoming_reminders(chat_id: int) -> list[dict]:
     with _conn() as conn:
         rows = conn.execute(
-            """SELECT id, user_id, message, remind_at FROM reminders
+            """SELECT id, user_id, message, remind_at, recurrence FROM reminders
                WHERE chat_id=? AND sent=0 AND remind_at >= ?
                ORDER BY remind_at""",
             (chat_id, _now().isoformat()),
@@ -81,7 +92,7 @@ def get_upcoming_reminders(chat_id: int) -> list[dict]:
 def get_todays_reminders(chat_id: int) -> list[dict]:
     with _conn() as conn:
         rows = conn.execute(
-            """SELECT id, user_id, message, remind_at FROM reminders
+            """SELECT id, user_id, message, remind_at, recurrence FROM reminders
                WHERE chat_id=? AND sent=0 AND date(remind_at)=?
                ORDER BY remind_at""",
             (chat_id, _today().isoformat()),
@@ -92,7 +103,8 @@ def get_todays_reminders(chat_id: int) -> list[dict]:
 def get_due_reminders() -> list[dict]:
     with _conn() as conn:
         rows = conn.execute(
-            "SELECT id, user_id, chat_id, message FROM reminders WHERE sent=0 AND remind_at <= ?",
+            """SELECT id, user_id, chat_id, message, remind_at, recurrence
+               FROM reminders WHERE sent=0 AND remind_at <= ?""",
             (_now().isoformat(),),
         ).fetchall()
     return [dict(r) for r in rows]
