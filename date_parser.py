@@ -105,6 +105,47 @@ def _parse_date(s: str, today: date) -> Optional[date]:
     return None
 
 
+def find_datetime_in_text(text: str, tz=None):
+    """
+    Find a date and time anywhere in free-form text, in any order.
+    Returns (datetime | None, leftover_str).
+    """
+    today = datetime.now(tz).date() if tz else date.today()
+    words = text.split()
+    n = len(words)
+
+    date_hit = None  # (start_idx, span, date_obj)
+    time_hit = None  # (idx, (hour, min))
+
+    for i in range(n):
+        if date_hit is not None:
+            break
+        if i + 1 < n:
+            d = _parse_date(f"{words[i].lower()} {words[i+1].lower()}", today)
+            if d is not None:
+                date_hit = (i, 2, d)
+                continue
+        d = _parse_date(words[i].lower(), today)
+        if d is not None:
+            date_hit = (i, 1, d)
+
+    for i, word in enumerate(words):
+        t = _parse_time(word.lower())
+        if t is not None:
+            time_hit = (i, t)
+            break
+
+    if date_hit is None or time_hit is None:
+        return None, text
+
+    d_start, d_span, parsed_date = date_hit
+    t_idx, (h, m) = time_hit
+    dt = datetime(parsed_date.year, parsed_date.month, parsed_date.day, h, m, 0)
+    skip = set(range(d_start, d_start + d_span)) | {t_idx}
+    leftover = " ".join(w for i, w in enumerate(words) if i not in skip).strip()
+    return dt, leftover or "Reminder"
+
+
 def _parse_time(s: str) -> Optional[tuple[int, int]]:
     if s == "noon":
         return (12, 0)
