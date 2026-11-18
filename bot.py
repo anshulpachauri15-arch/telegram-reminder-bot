@@ -348,7 +348,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             },
         )
         if results:
-            date_str_found, remind_at = results[0]
+            # Take the longest matched string — it's the most specific
+            date_str_found, remind_at = max(results, key=lambda x: len(x[0]))
             if recurrence == "daily" and remind_at <= now:
                 remind_at += timedelta(days=1)
             reminder_text = parse_text.replace(date_str_found, "").strip()

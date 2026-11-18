@@ -6,6 +6,7 @@ Falls back gracefully if the token is not configured.
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -77,12 +78,19 @@ def parse_reminder(text: str) -> Optional[dict]:
                 {"role": "system", "content": _SYSTEM.format(context=context)},
                 {"role": "user", "content": text},
             ],
-            response_format={"type": "json_object"},
             max_tokens=150,
             temperature=0,
         )
-        data = json.loads(response.choices[0].message.content)
+        raw = response.choices[0].message.content.strip()
+        log.info(f"LLM raw response: {raw}")
+
+        # Strip markdown code fences if the model wrapped the JSON
+        raw = re.sub(r"^```json?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+
+        data = json.loads(raw)
         remind_at = datetime.fromisoformat(data["remind_at"])
+        log.info(f"LLM parsed: remind_at={remind_at} message={data.get('message')} recurrence={data.get('recurrence')}")
         return {
             "remind_at": remind_at,
             "message": str(data.get("message") or text),
